@@ -1,0 +1,14 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python3 -c \"from google.adk.agents import LoopAgent, SequentialAgent; help\\(LoopAgent\\)\")",
+      "Bash(python3 -c \"from google.adk.agents import SequentialAgent; help\\(SequentialAgent\\)\")",
+      "Bash(python3 -c \"from google.adk.tools import exit_loop; help\\(exit_loop\\)\")",
+      "Bash(python3 -c \"from google.adk.agents import Workflow; help\\(Workflow\\)\")",
+      "Bash(python3 -c \"import google.adk.agents as a; print\\(dir\\(a\\)\\)\")",
+      "Bash(python3 -c \"import google.adk.workflow as w; print\\(dir\\(w\\)\\)\")",
+      "Bash(python3 -c \"from google.adk.workflow import Workflow, Node, Edge; help\\(Workflow\\)\")",
+      "Bash(.venv/bin/python3 *)"
+    ]
+  }
+}
