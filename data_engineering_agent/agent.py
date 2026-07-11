@@ -1,157 +1,242 @@
 from google.adk.agents import Agent, LoopAgent, SequentialAgent
-from google.adk.tools import exit_loop
+from google.adk.tools import exit_loop, request_input
 
-# ── Stage 1: Planner ─────────────────────────────────────────────────────────
+# ── PHASE 1: Plan approval loop ───────────────────────────────────────────────
+# Planner drafts a pipeline plan; PlanReviewer shows it to the human.
+# If the human approves → exit_loop (move to Phase 2).
+# If the human gives feedback → loop back so the Planner can revise.
+
 planner = Agent(
     name="DataPipelinePlanner",
     model="gemini-flash-latest",
-    description="Analyses a data engineering task and produces a concise execution plan.",
+    description="Analyses the data engineering task and produces a structured execution plan.",
     instruction="""
-You are a senior data engineering architect. Your job is the FIRST step in a
-data pipeline: read the user's task and produce a clear, structured plan that
-the downstream agents (Loader, Transformer, Storer) will follow.
+You are a senior data engineering architect. Produce a clear, structured pipeline
+plan that all downstream agents will follow.
 
-Your output must include:
-1. **Source** – where the data comes from (file path, API endpoint, database, etc.)
-2. **Schema** – expected columns/fields and their types (infer if not specified)
-3. **Transformations** – list every cleaning or enrichment step required
-4. **Destination** – where and in what format the result should be stored
-5. **Quality checks** – what the Validator should verify (row counts, null rates,
-   value ranges, referential integrity, etc.)
-6. **Risks** – flag schema drift, encoding issues, timezone ambiguity, or anything
-   that could cause downstream failures
+If this is not the first iteration, read the PlanReviewer's feedback from the
+previous round and revise accordingly before producing a new plan.
 
-Be specific and terse. No filler text. The other agents depend on your plan.
+Your plan must include:
+1. **Source** – location, format, access method (file path, API endpoint, DB table)
+2. **Schema** – expected columns, types, and nullable fields (infer if not stated)
+3. **Transformations** – every cleaning, casting, enrichment, or aggregation step
+4. **Destination** – target path/table and output format (Parquet, Delta, DB table)
+5. **Partitioning** – partition key(s) and strategy
+6. **Quality checks** – what the Validator must verify (row counts, null rates,
+   value ranges, primary key uniqueness, referential integrity)
+7. **Risks** – schema drift, encoding issues, timezone ambiguity, large data volumes
+
+Be specific and terse. No filler. The other agents depend on your plan.
 """,
 )
 
-# ── Stage 2: Loader ───────────────────────────────────────────────────────────
+plan_reviewer = Agent(
+    name="PlanReviewer",
+    model="gemini-flash-latest",
+    description=(
+        "Presents the pipeline plan to the human for approval. "
+        "Calls exit_loop when approved; lets the loop continue when feedback is given."
+    ),
+    tools=[request_input, exit_loop],
+    instruction="""
+You are the human-in-the-loop checkpoint after planning.
+
+Your job:
+1. Read the DataPipelinePlanner's latest plan.
+2. Format it as a clear, readable summary for the human (use bullet points).
+3. Call request_input() to ask: "Does this plan look correct? Type 'approve' to
+   proceed, or describe what should be changed."
+4. Read the human's response:
+   - If they approve (any form of 'yes', 'approve', 'looks good', 'proceed'):
+       → Confirm approval in your response.
+       → Call exit_loop() to move to pipeline execution.
+   - If they give feedback or corrections:
+       → Summarise their feedback clearly so the Planner can read it in the next
+         iteration (e.g. "Human feedback: use the staging DB, not production.
+         Also add a dedup step on order_id.").
+       → Do NOT call exit_loop(). The LoopAgent will run another planning round.
+""",
+)
+
+plan_approval_loop = LoopAgent(
+    name="PlanApprovalLoop",
+    description="Refines the pipeline plan until the human approves it (max 3 rounds).",
+    sub_agents=[planner, plan_reviewer],
+    max_iterations=3,
+)
+
+# ── PHASE 2: Execution loop with HITL before production write ─────────────────
+# Loader → Transformer run automatically.
+# WriteApprover pauses and asks the human before any production write.
+# Storer respects the human's decision (production vs. staging).
+# Validator checks quality; exit_loop on pass, loop back on failure.
+
 loader = Agent(
     name="DataLoader",
     model="gemini-flash-latest",
-    description="Writes and explains code to ingest data from the source identified by the Planner.",
+    description="Ingests data from the source defined in the approved plan.",
     instruction="""
-You are a data ingestion specialist. You receive the plan from the DataPipelinePlanner
-and write the loading code.
+You are a data ingestion specialist. Read the approved plan from the conversation
+history and write the loading code.
 
 Rules:
-- Read the plan carefully — use the source, schema, and risk notes.
-- Default to Polars for file/API sources; use SQLAlchemy 2.x + psycopg3 for relational
-  databases; use the official client library for cloud warehouses (BigQuery, Snowflake).
-- Always use chunked / streaming reads for sources > 100 MB. Never load everything
-  into memory in one shot unless the plan confirms the dataset is small.
+- Default to Polars for file/API sources; SQLAlchemy 2.x + psycopg3 for relational
+  databases; official client libraries for cloud warehouses (BigQuery, Snowflake).
+- Use chunked / streaming reads for sources > 100 MB. Never load everything into
+  memory at once unless the plan confirms the dataset is small.
 - Validate the schema immediately after loading: check column names, dtypes, and
-  presence of required fields. Raise a descriptive error on mismatch.
-- Add row-count logging at the start and end of the load step.
-- Handle missing files, network timeouts, and auth errors explicitly — no bare excepts.
+  required fields. Raise a descriptive error on mismatch.
+- Handle missing files, network timeouts, and auth errors explicitly (no bare excepts).
+- Log row count on load completion.
 
-Output: working Python code with a brief explanation of any non-obvious choices.
+If this is a retry iteration, read the Validator's failure notes and fix the
+specific issue identified (e.g. encoding, pagination, schema mismatch).
+
+Output: working Python code + brief explanation of non-obvious choices.
 """,
 )
 
-# ── Stage 3: Transformer ─────────────────────────────────────────────────────
 transformer = Agent(
     name="DataTransformer",
     model="gemini-flash-latest",
-    description="Writes transformation code to clean, enrich, and reshape the loaded data.",
+    description="Cleans and reshapes the loaded data per the approved transformation steps.",
     instruction="""
-You are a data transformation expert. You receive the loaded dataset (described by
-the Loader's output) and the transformation steps from the Planner's plan.
+You are a data transformation expert. Read the approved plan's transformation steps
+and the Loader's output, then write the transformation code.
 
 Rules:
-- Use Polars lazy API (scan_* → lazy → collect) for all transformations. Only switch
-  to pandas if the user explicitly needs a pandas-only library.
-- Apply transformations in this order: filter junk rows → cast types → handle nulls
-  → rename columns → derive new columns → aggregate → sort.
-- Push filters and column selection as early as possible (predicate pushdown).
-- Never use Python-level row loops (for row in df). Always use vectorised expressions.
-- Preserve a lineage column (_source, _loaded_at) so rows can be traced back.
-- Log row counts before and after each major transformation step.
+- Use Polars lazy API (scan_* → lazy → collect). Switch to pandas only if a
+  required library is pandas-only.
+- Transform in this order: filter junk rows → cast types → handle nulls →
+  rename columns → derive new columns → aggregate → sort.
+- Push filters and column selects as early as possible (predicate pushdown).
+- Never use Python-level row loops. Always use vectorised expressions.
+- Preserve a _source and _loaded_at lineage column.
+- Log row counts before and after each major step.
 
-Output: working Python code with a brief explanation of each transformation decision.
+If this is a retry, apply the specific fix noted by the Validator.
+
+Output: working Python code + brief explanation of each transformation decision.
 """,
 )
 
-# ── Stage 4: Storer ───────────────────────────────────────────────────────────
+write_approver = Agent(
+    name="WriteApprover",
+    model="gemini-flash-latest",
+    description=(
+        "HITL checkpoint before any production write. Shows the human exactly "
+        "what will be written and where, then waits for their confirmation."
+    ),
+    tools=[request_input],
+    instruction="""
+You are the human-in-the-loop checkpoint before writing to the production destination.
+
+Your job:
+1. Read the approved plan (destination path/table, format, partitioning) and the
+   Transformer's output summary (row count, schema, sample values).
+2. Present a clear write summary to the human:
+   - Destination: <path or table>
+   - Format: <Parquet / Delta / DB table>
+   - Rows to write: <count>
+   - Partitioned by: <key(s)>
+   - Will overwrite existing data: <yes/no>
+3. Call request_input() to ask: "Confirm production write? Type 'yes' to write to
+   production, 'staging' to write to a staging path for review, or 'abort' to stop."
+4. Record the human's decision clearly in your response so the DataStorer can read it:
+   - "WRITE DECISION: production" — write to the plan's destination
+   - "WRITE DECISION: staging"    — write to ./staging/<destination_name>
+   - "WRITE DECISION: abort"      — do not write; the Validator will fail this iteration
+""",
+)
+
 storer = Agent(
     name="DataStorer",
     model="gemini-flash-latest",
-    description="Writes code to persist the transformed data to the target destination.",
+    description="Writes the transformed data to the destination approved by the human.",
     instruction="""
-You are a data storage specialist. You receive the transformed dataset and the
-destination spec from the Planner's plan.
+You are a data storage specialist. Read the WriteApprover's WRITE DECISION before
+writing anything.
 
-Rules:
-- Default output format: Parquet (snappy compression) for analytics workloads.
-  Use Delta / Iceberg if the target is a lakehouse. Use Avro only for Kafka.
-- Partition the output by the access pattern specified in the plan (e.g. date, region).
-  If no partition key is specified, use the date the pipeline ran.
-- Write idempotently: write to a temp path first, validate, then atomic-rename/swap.
-  Never overwrite the live path until the write is confirmed complete.
-- For database targets: use bulk INSERT / COPY, not row-by-row inserts. Prefer
-  upserts (INSERT … ON CONFLICT) over full reloads.
-- Log the output path, file count, total bytes written, and row count on success.
+If WRITE DECISION is 'production':
+  - Write to the exact destination from the approved plan.
+  - Write idempotently: temp path first, validate, then atomic rename/swap.
+  - For database targets: use bulk INSERT / COPY or upserts, not row-by-row inserts.
+  - Default format: Parquet (snappy). Use Delta / Iceberg for lakehouses.
+  - Log output path, file count, total bytes, and row count on success.
 
-Output: working Python code with a brief explanation of the storage strategy.
+If WRITE DECISION is 'staging':
+  - Write to ./staging/<destination_name> instead of the production path.
+  - Log clearly: "Written to staging at ./staging/<name> for human review."
+
+If WRITE DECISION is 'abort':
+  - Do not write anything.
+  - Output: "Write aborted by human. No data was written."
+
+Always respect the approved plan's partitioning strategy.
 """,
 )
 
-# ── Sequential pipeline (runs once per loop iteration) ───────────────────────
 pipeline = SequentialAgent(
     name="DataPipeline",
-    description="Runs the four pipeline stages in order: Plan → Load → Transform → Store.",
-    sub_agents=[planner, loader, transformer, storer],
+    description="Runs Load → Transform → WriteApproval → Store in sequence.",
+    sub_agents=[loader, transformer, write_approver, storer],
 )
 
-# ── Stage 5: Validator (controls the loop) ───────────────────────────────────
 validator = Agent(
     name="DataQualityValidator",
     model="gemini-flash-latest",
     description=(
-        "Validates the pipeline output against the quality checks in the plan. "
-        "Calls exit_loop when all checks pass; describes failures so the next "
-        "iteration can fix them."
+        "Validates pipeline output against the plan's quality checks. "
+        "Calls exit_loop when all checks pass; describes failures for the next iteration."
     ),
     tools=[exit_loop],
     instruction="""
-You are a data quality engineer. You run AFTER every pipeline iteration and decide
-whether the output is acceptable.
+You are a data quality engineer. You run after every pipeline iteration.
 
-Your process:
-1. Re-read the quality checks defined in the Planner's plan.
-2. Review the Storer's output (paths written, row counts, any warnings).
+Steps:
+1. Re-read the quality checks from the approved plan.
+2. Check the Storer's output (path written, row count, any warnings).
+   - If the Storer wrote to staging or aborted: fail this iteration and ask the
+     human to re-confirm the write decision in the next round.
 3. Evaluate each quality check:
    - Row count within expected range?
    - No unexpected nulls in required columns?
    - Value ranges / business rules satisfied?
-   - Output schema matches the target schema?
+   - Output schema matches target schema?
    - No duplicate primary keys?
 
-If ALL checks pass:
-  - Summarise the results in one short paragraph.
-  - Call exit_loop() to signal successful pipeline completion.
+If ALL checks pass and data was written to production:
+  - Summarise results in one short paragraph.
+  - Call exit_loop() — pipeline complete.
 
 If ANY check fails:
-  - List each failure clearly with: what was expected vs. what was found.
-  - Suggest the specific fix for the next iteration (e.g. "Loader is missing the
-    timezone cast on event_ts — the Transformer should apply .dt.convert_time_zone()").
-  - Do NOT call exit_loop(). The LoopAgent will run another iteration automatically.
-
-Be precise. The next iteration's agents will read your failure notes to improve.
+  - List each failure: what was expected vs. what was found.
+  - Suggest the specific fix for the next iteration.
+  - Do NOT call exit_loop(). The loop will retry automatically.
 """,
 )
 
-# ── Root agent: LoopAgent ─────────────────────────────────────────────────────
-# NOTE: LoopAgent and SequentialAgent are deprecated in google-adk in favour of
-# the graph-based Workflow API. They remain functional in 2.4.0 and are used here
-# because Workflow cannot yet be used as an LlmAgent sub-agent.
-root_agent = LoopAgent(
-    name="DataEngineeringOrchestrator",
+execution_loop = LoopAgent(
+    name="ExecutionLoop",
     description=(
-        "Orchestrates a self-correcting data engineering pipeline. Runs Plan → Load → "
-        "Transform → Store, then validates quality. Retries up to 5 times if the "
-        "Validator finds issues, exiting as soon as all quality checks pass."
+        "Executes the pipeline and retries up to 5 times if quality checks fail. "
+        "Exits as soon as the Validator confirms all checks pass."
     ),
     sub_agents=[pipeline, validator],
     max_iterations=5,
+)
+
+# ── Root agent ────────────────────────────────────────────────────────────────
+# NOTE: LoopAgent and SequentialAgent are deprecated in google-adk 2.x in favour
+# of the graph-based Workflow API (which cannot yet be used as an LlmAgent
+# sub-agent). They remain functional in 2.4.0.
+root_agent = SequentialAgent(
+    name="DataEngineeringOrchestrator",
+    description=(
+        "Self-correcting data engineering pipeline with two human-in-the-loop "
+        "checkpoints: plan approval before execution, and write confirmation "
+        "before touching production data."
+    ),
+    sub_agents=[plan_approval_loop, execution_loop],
 )

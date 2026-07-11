@@ -1,96 +1,140 @@
 # Data Engineering Agent
 
-A self-correcting, multi-agent data pipeline built with Google ADK. It plans, loads,
-transforms, stores, and validates data — retrying automatically when quality checks fail.
+A self-correcting, multi-agent data pipeline with two **human-in-the-loop** checkpoints.
+It plans, loads, transforms, stores, and validates data — pausing for human approval
+at the two moments where a mistake is most expensive to fix.
 
 ---
 
 ## Architecture
 
 ```
-LoopAgent  (DataEngineeringOrchestrator)
+SequentialAgent  (DataEngineeringOrchestrator)  ← root_agent
 │
-│  Runs the inner pipeline + validator on each iteration.
-│  Exits when the Validator calls exit_loop() or after 5 iterations.
+│  Phase 1 completes fully before Phase 2 begins.
 │
-├── SequentialAgent  (DataPipeline)
+├── LoopAgent  (PlanApprovalLoop, max 3 rounds)
 │   │
-│   │  Each stage sees the full conversation history of all prior stages.
+│   │  Refines the plan until the human approves it.
 │   │
 │   ├── DataPipelinePlanner
-│   │     Reads the user task → produces a structured plan:
+│   │     Reads the task (and any prior human feedback) → produces a structured plan:
 │   │     source, schema, transformations, destination, quality checks, risks.
 │   │
-│   ├── DataLoader
-│   │     Reads the plan → writes chunked ingestion code.
-│   │     Defaults: Polars for files/APIs, SQLAlchemy 2.x for relational DBs.
-│   │
-│   ├── DataTransformer
-│   │     Reads the plan + loader output → writes vectorised transformation code.
-│   │     Uses Polars lazy API. Applies filter → cast → null-handling → enrich → agg.
-│   │
-│   └── DataStorer
-│         Reads the plan + transformer output → writes idempotent storage code.
-│         Defaults: Parquet (snappy), partitioned by access pattern, temp-then-swap.
+│   └── PlanReviewer  [tools: request_input, exit_loop]   ← HITL checkpoint 1
+│         Formats the plan for the human and calls request_input().
+│         Human approves → call exit_loop() → move to Phase 2.
+│         Human gives feedback → record it, do NOT exit_loop → Planner revises.
 │
-└── DataQualityValidator  (has exit_loop tool)
-      Runs after each full pipeline iteration.
-      Checks row counts, nulls, schema, value ranges, duplicate keys.
-      → All pass: calls exit_loop() — pipeline complete.
-      → Any fail: describes failures so the next iteration can fix them.
+└── LoopAgent  (ExecutionLoop, max 5 rounds)
+    │
+    │  Executes the approved plan, retrying if quality checks fail.
+    │
+    ├── SequentialAgent  (DataPipeline)
+    │   │
+    │   ├── DataLoader
+    │   │     Writes chunked ingestion code per the approved plan.
+    │   │     Fixes the specific issue noted by the Validator on retries.
+    │   │
+    │   ├── DataTransformer
+    │   │     Writes vectorised Polars transformation code.
+    │   │     Applies plan's transform steps in order: filter → cast → nulls → enrich → agg.
+    │   │
+    │   ├── WriteApprover  [tools: request_input]          ← HITL checkpoint 2
+    │   │     Presents write summary (destination, rows, format, partition key).
+    │   │     Calls request_input() — human replies 'yes', 'staging', or 'abort'.
+    │   │     Records decision as "WRITE DECISION: <choice>" for the Storer to read.
+    │   │
+    │   └── DataStorer
+    │         Reads WRITE DECISION:
+    │         'production' → writes to plan's destination (temp → validate → swap).
+    │         'staging'    → writes to ./staging/<name> for human review.
+    │         'abort'      → writes nothing; Validator will fail this iteration.
+    │
+    └── DataQualityValidator  [tools: exit_loop]
+          Checks row counts, nulls, schema, value ranges, duplicate PKs.
+          All pass + production write → call exit_loop() → done.
+          Any fail → describe the issue → loop retries automatically.
 ```
 
-### Why LoopAgent + SequentialAgent?
+### Why two separate LoopAgents?
 
-Data engineering work is inherently iterative — schema mismatches, null edge cases,
-and encoding issues are rarely caught on the first pass. The loop lets the system
-self-correct instead of failing hard. The inner SequentialAgent enforces the correct
-stage order (you cannot transform before loading).
+A single loop would mix two concerns: plan correctness (should we do this at all?)
+and execution quality (did we do it right?). Separating them means:
 
-> Note: `LoopAgent` and `SequentialAgent` are deprecated in google-adk 2.x in favour
-> of the graph-based `Workflow` API. They remain functional in 2.4.0 and are used here
-> because `Workflow` cannot yet be used as an `LlmAgent` sub-agent.
+- The plan is signed off by a human **before** any data is touched
+- Execution retries only fix code/data issues, never re-open the plan
+- The human never sees a "plan approval" prompt mid-retry of a quality failure
+
+### Why HITL at these two points?
+
+| Checkpoint | Cost of getting it wrong without HITL |
+|---|---|
+| After planning | Low — just a plan on paper. Catching a wrong source or missing step here is free. |
+| Before production write | High — overwriting a production table or file is hard to reverse, especially at scale. |
+
+Interrupting between Load → Transform → Store would add friction with no benefit
+(those steps follow the already-approved plan mechanically).
 
 ---
 
 ## How to run
 
 ```bash
-# Terminal REPL
+# Terminal REPL (shows each agent's turn inline)
 uv run adk run data_engineering_agent
 
-# Browser UI (recommended — shows each agent's output separately)
+# Browser UI (recommended — shows each agent separately, HITL prompts appear in UI)
 uv run adk web data_engineering_agent
 ```
 
 ---
 
-## Example prompts
+## Example session
 
-**Basic ETL**
 ```
-Load sales_data.csv, remove duplicate order_ids, cast order_date to date,
-and store the result as Parquet partitioned by order_date.
-```
+User:  Load sales.csv, remove duplicate order_ids, cast order_date to date,
+       store as Parquet partitioned by order_date.
 
-**API ingestion**
-```
-Fetch all pages from the /api/v1/events endpoint (requires Bearer token in
-Authorization header), keep only events where status = 'completed',
-and upsert into the postgres events table on event_id.
-```
+--- Phase 1: Plan Approval ---
 
-**Database-to-warehouse**
-```
-Extract all rows from the mysql orders table where updated_at > yesterday,
-join with the customers table on customer_id, and load into BigQuery
-dataset=analytics, table=orders_enriched, partitioned by order_date.
-```
+DataPipelinePlanner:  [produces plan]
 
-**Troubleshooting**
-```
-My Spark job reading from GCS is OOMing on the executor. The dataset is
-500 GB Parquet and I'm doing a join on user_id. How should I fix this?
+PlanReviewer:  Here's the pipeline plan:
+  • Source: sales.csv (CSV, local filesystem)
+  • Schema: order_id (str), order_date (str→date), amount (float), customer_id (str)
+  • Transformations: dedup on order_id, cast order_date to Date
+  • Destination: ./output/sales.parquet, partitioned by order_date
+  • Quality checks: row count ≥ 1, no nulls in order_id, no duplicate order_ids
+  Does this look correct? Type 'approve' or describe what should be changed.
+
+User:  approve
+
+PlanReviewer:  Plan approved. → calls exit_loop()
+
+--- Phase 2: Execution ---
+
+DataLoader:      [writes ingestion code, logs 84,201 rows loaded]
+DataTransformer: [writes dedup + cast code, logs 83,950 rows after dedup]
+
+WriteApprover:   Write summary:
+  • Destination: ./output/sales.parquet
+  • Format: Parquet (snappy)
+  • Rows: 83,950
+  • Partitioned by: order_date
+  • Will overwrite existing: no (new path)
+  Confirm production write? Type 'yes', 'staging', or 'abort'.
+
+User:  yes
+
+WriteApprover:  WRITE DECISION: production
+DataStorer:     [writes to ./output/sales.parquet, logs 83,950 rows, 12.4 MB]
+
+DataQualityValidator:  All checks passed:
+  ✓ 83,950 rows (expected ≥ 1)
+  ✓ No nulls in order_id
+  ✓ No duplicate order_ids
+  Pipeline complete. → calls exit_loop()
 ```
 
 ---
@@ -99,16 +143,16 @@ My Spark job reading from GCS is OOMing on the executor. The dataset is
 
 | Decision | Rationale |
 |---|---|
-| Polars as default (not pandas) | Lazy evaluation, columnar, faster on modern hardware, better for large-than-RAM datasets via streaming |
-| Storer writes to temp path first | Prevents partial writes corrupting the live dataset if the job is interrupted |
-| Validator controls loop exit | Quality checks are data-driven — the validator reads the Planner's checks, not a hardcoded list |
-| max_iterations = 5 | Prevents infinite loops on persistent data quality issues; 5 is enough for most real-world self-correction cycles |
-| Each agent sees full conversation history | Downstream agents (Transformer, Storer) have the full context of what the Planner and Loader decided — no need to re-specify |
+| Polars lazy API by default | Lazy evaluation + columnar format handles larger-than-RAM datasets; predicate pushdown minimises I/O |
+| WriteApprover uses 'staging' option | Gives the human a safe middle ground — review the data before committing to production |
+| Storer writes temp → validate → swap | Prevents partial writes from corrupting the live dataset if the job is interrupted mid-write |
+| Validator controls ExecutionLoop exit | Quality checks are data-driven from the plan, not hardcoded — works for any pipeline |
+| Plan loop max 3, execution loop max 5 | Plan rarely needs more than 2 revisions; execution may need more retries for data quality edge cases |
 
 ---
 
-## Model
+## Models
 
-All agents use `gemini-flash-latest` — sufficient for code generation and reasoning
-tasks at this complexity level. Upgrade to `gemini-pro-latest` if you need deeper
-multi-hop reasoning (e.g. very complex SQL generation or large schema inference).
+All agents use `gemini-flash-latest`. Upgrade individual agents to `gemini-pro-latest`
+if you need deeper reasoning — most likely candidates are `DataPipelinePlanner`
+(complex schema inference) or `DataTransformer` (intricate multi-step logic).
