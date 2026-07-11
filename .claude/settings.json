@@ -5,7 +5,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "git add -A 2>/dev/null; git diff --cached --quiet || git commit -m \"auto-save: $(date '+%Y-%m-%d %H:%M')\"; git remote get-url origin > /dev/null 2>&1 && git push || true",
+            "command": "last=$(git log -1 --format='%cd' --date=format:'%Y-%m-%d' 2>/dev/null); today=$(date '+%Y-%m-%d'); [ \"$last\" = \"$today\" ] && exit 0; git add -A 2>/dev/null; git diff --cached --quiet || git commit -m \"auto-save: $today\"; git remote get-url origin > /dev/null 2>&1 && git push || true",
             "statusMessage": "Committing and pushing changes to GitHub..."
           }
         ]
