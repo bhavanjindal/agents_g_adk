@@ -48,6 +48,15 @@ Use `*-latest` aliases per Google docs to avoid pinning to outdated versions:
 
 **Rule of thumb:** default to `gemini-flash-latest`. Only step up to `gemini-pro-latest` for deep multi-step reasoning or very long context.
 
+## Agent documentation convention
+
+Every agent directory must include a `README.md` alongside `agent.py`. It should cover:
+- What the agent does and why it was built
+- Architecture (agent type, sub-agents, tools)
+- How to run it
+- Example prompts
+- Key design decisions
+
 ## Architecture
 
 Each agent lives in its own subdirectory (e.g. `hello_agent/`) and must contain an `agent.py` that exposes a `root_agent` — an instance of `google.adk.agents.Agent`. The ADK CLI discovers agents by looking for this `root_agent` variable.
