@@ -1,0 +1,8 @@
+
+
+========= local CSV to mongodb load ========== zero transformation, plain load =====================
+
+Mongodb load --> i want to load tested.csv file into mongodb URI available at mongodb://root:example@localhost:27017/?authSource=admin .. in userdb database and titanic collection
+
+
+

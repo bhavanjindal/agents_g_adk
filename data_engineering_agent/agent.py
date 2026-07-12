@@ -1,5 +1,55 @@
+import os
+
 from google.adk.agents import Agent, LoopAgent, SequentialAgent
+from google.adk.code_executors import UnsafeLocalCodeExecutor
 from google.adk.tools import exit_loop, request_input
+
+
+def _resolve_model():
+    """Picks the LLM backend for every agent below from env vars, so the whole
+    pipeline can switch between Gemini, Anthropic, and a local Ollama model
+    without any code changes. See .env.example for all three configurations.
+
+    AGENT_MODEL_PROVIDER=gemini (default) → GEMINI_MODEL (default gemini-flash-latest)
+    AGENT_MODEL_PROVIDER=anthropic        → ANTHROPIC_MODEL (default claude-sonnet-5)
+                                            via ADK's native Claude wrapper, reading
+                                            ANTHROPIC_API_KEY the standard SDK way
+    AGENT_MODEL_PROVIDER=ollama           → OLLAMA_MODEL (default llama3) via
+                                            litellm, against OLLAMA_API_BASE
+                                            (default http://localhost:11434)
+    """
+    provider = os.getenv("AGENT_MODEL_PROVIDER", "gemini").lower()
+    if provider == "anthropic":
+        from google.adk.models.anthropic_llm import AnthropicLlm
+
+        return AnthropicLlm(model=os.getenv("ANTHROPIC_MODEL", "claude-sonnet-5"))
+    if provider == "ollama":
+        from google.adk.models.lite_llm import LiteLlm
+
+        ollama_model = os.getenv("OLLAMA_MODEL", "llama3")
+        api_base = os.getenv("OLLAMA_API_BASE", "http://localhost:11434")
+        return LiteLlm(model=f"ollama_chat/{ollama_model}", api_base=api_base)
+    if provider != "gemini":
+        raise ValueError(
+            f"Unknown AGENT_MODEL_PROVIDER: {provider!r} (expected 'gemini', 'anthropic', or 'ollama')"
+        )
+    return os.getenv("GEMINI_MODEL", "gemini-flash-latest")
+
+
+MODEL = _resolve_model()
+
+# DataLoader/DataTransformer/DataStorer run their code for real via
+# UnsafeLocalCodeExecutor — plain `exec()` in a subprocess on this machine, no
+# sandbox. That's what lets them reach localhost services (e.g. the local
+# MongoDB from docker_compose.yaml), but it means the LLM-generated code has
+# full access to the local filesystem/network. Fine for this learning repo;
+# do not point this agent at a shared or production host as-is.
+#
+# Each execution is a fresh, non-stateful subprocess, so nothing in memory
+# survives between agent turns. Loader/Transformer/Storer hand off data via a
+# fixed staging path on disk instead of shared Python variables.
+STAGE_LOADED = "./output/_stage_loaded.parquet"
+STAGE_TRANSFORMED = "./output/_stage_transformed.parquet"
 
 # ── PHASE 1: Plan approval loop ───────────────────────────────────────────────
 # Planner drafts a pipeline plan; PlanReviewer shows it to the human.
@@ -8,7 +58,7 @@ from google.adk.tools import exit_loop, request_input
 
 planner = Agent(
     name="DataPipelinePlanner",
-    model="gemini-flash-latest",
+    model=MODEL,
     description="Analyses the data engineering task and produces a structured execution plan.",
     instruction="""
 You are a senior data engineering architect. Produce a clear, structured pipeline
@@ -33,7 +83,7 @@ Be specific and terse. No filler. The other agents depend on your plan.
 
 plan_reviewer = Agent(
     name="PlanReviewer",
-    model="gemini-flash-latest",
+    model=MODEL,
     description=(
         "Presents the pipeline plan to the human for approval. "
         "Calls exit_loop when approved; lets the loop continue when feedback is given."
@@ -66,6 +116,39 @@ plan_approval_loop = LoopAgent(
     max_iterations=3,
 )
 
+# ── PHASE 1.5: Execution mode checkpoint ──────────────────────────────────────
+# Runs once, after the plan is approved and before the (possibly retrying)
+# execution loop — asks the human whether code should actually run on this
+# machine or only be printed for review. DataLoader/Transformer/Storer read
+# "EXECUTION MODE" from this agent's response each turn to decide which fence
+# to use (```python = runs for real, ```text = shown only, never executed).
+
+execution_mode_chooser = Agent(
+    name="ExecutionModeChooser",
+    model=MODEL,
+    description=(
+        "Asks the human whether pipeline code should be executed for real on "
+        "this machine, or only printed for review."
+    ),
+    tools=[request_input],
+    instruction="""
+You are the checkpoint between plan approval and pipeline execution.
+
+Call request_input() to ask the human:
+"How should I handle the pipeline code? Type 'execute' to actually run it on this
+machine (it will read/write real files and can reach local services like MongoDB),
+or 'print' to only show you the generated scripts without running anything."
+
+Read the response and record your decision as EXACTLY one of these lines (plus a
+one-sentence acknowledgement — no code, you don't generate pipeline code):
+- Anything meaning run it ('execute', 'run', 'yes'):      "EXECUTION MODE: execute"
+- Anything meaning review only ('print', 'no', 'dry run', 'just show me'):
+                                                           "EXECUTION MODE: print_only"
+
+If the response is ambiguous, call request_input() again to clarify — do not guess.
+""",
+)
+
 # ── PHASE 2: Execution loop with HITL before production write ─────────────────
 # Loader → Transformer run automatically.
 # WriteApprover pauses and asks the human before any production write.
@@ -74,38 +157,65 @@ plan_approval_loop = LoopAgent(
 
 loader = Agent(
     name="DataLoader",
-    model="gemini-flash-latest",
-    description="Ingests data from the source defined in the approved plan.",
-    instruction="""
+    model=MODEL,
+    description="Ingests data from the source defined in the approved plan and actually runs it.",
+    code_executor=UnsafeLocalCodeExecutor(),
+    instruction=f"""
 You are a data ingestion specialist. Read the approved plan from the conversation
 history and write the loading code.
 
+Check the "EXECUTION MODE" recorded by ExecutionModeChooser earlier in the conversation:
+- "EXECUTION MODE: execute"    → put your code in a single ```python fenced block.
+  It WILL run for real (only the first code block per turn executes). Read the
+  execution output before writing your final summary; report what actually
+  happened, not what you expect to happen.
+- "EXECUTION MODE: print_only" → put the exact same code in a ```text fenced
+  block instead (never ```python). This is deliberate — it prevents execution.
+  Say clearly that this is a preview only and nothing was run.
+
 Rules:
-- Default to Polars for file/API sources; SQLAlchemy 2.x + psycopg3 for relational
-  databases; official client libraries for cloud warehouses (BigQuery, Snowflake).
+- Default to Polars for file/API sources; pymongo for MongoDB; SQLAlchemy 2.x +
+  psycopg3 for relational databases; official client libraries for cloud
+  warehouses (BigQuery, Snowflake).
 - Use chunked / streaming reads for sources > 100 MB. Never load everything into
   memory at once unless the plan confirms the dataset is small.
 - Validate the schema immediately after loading: check column names, dtypes, and
   required fields. Raise a descriptive error on mismatch.
 - Handle missing files, network timeouts, and auth errors explicitly (no bare excepts).
-- Log row count on load completion.
+- print() the row count and schema on load completion — this is your only way to
+  report results, since nothing in memory survives past this turn.
+- Write the loaded data to `{STAGE_LOADED}` (Parquet) so DataTransformer can pick
+  it up — each pipeline step runs in its own isolated subprocess.
 
 If this is a retry iteration, read the Validator's failure notes and fix the
 specific issue identified (e.g. encoding, pagination, schema mismatch).
 
-Output: working Python code + brief explanation of non-obvious choices.
+Output: the executable code block, then a brief summary of the printed results.
 """,
 )
 
 transformer = Agent(
     name="DataTransformer",
-    model="gemini-flash-latest",
+    model=MODEL,
     description="Cleans and reshapes the loaded data per the approved transformation steps.",
-    instruction="""
+    code_executor=UnsafeLocalCodeExecutor(),
+    instruction=f"""
 You are a data transformation expert. Read the approved plan's transformation steps
-and the Loader's output, then write the transformation code.
+and the Loader's reported results, then write the transformation code.
+
+Check the "EXECUTION MODE" recorded by ExecutionModeChooser earlier in the conversation:
+- "EXECUTION MODE: execute"    → put your code in a single ```python fenced block.
+  It WILL run for real (only the first code block per turn executes). Read the
+  execution output before writing your final summary; report what actually
+  happened, not what you expect to happen.
+- "EXECUTION MODE: print_only" → put the exact same code in a ```text fenced
+  block instead (never ```python). This is deliberate — it prevents execution.
+  Say clearly that this is a preview only and nothing was run. (Note: in this
+  mode `{STAGE_LOADED}` won't actually exist — write the code as if it does.)
 
 Rules:
+- Load input from `{STAGE_LOADED}` (do not rely on in-memory variables from the
+  Loader's turn — each pipeline step runs in its own isolated subprocess).
 - Use Polars lazy API (scan_* → lazy → collect). Switch to pandas only if a
   required library is pandas-only.
 - Transform in this order: filter junk rows → cast types → handle nulls →
@@ -113,17 +223,18 @@ Rules:
 - Push filters and column selects as early as possible (predicate pushdown).
 - Never use Python-level row loops. Always use vectorised expressions.
 - Preserve a _source and _loaded_at lineage column.
-- Log row counts before and after each major step.
+- print() row counts before and after each major step.
+- Write the result to `{STAGE_TRANSFORMED}` (Parquet) so DataStorer can pick it up.
 
 If this is a retry, apply the specific fix noted by the Validator.
 
-Output: working Python code + brief explanation of each transformation decision.
+Output: the executable code block, then a brief summary of the printed results.
 """,
 )
 
 write_approver = Agent(
     name="WriteApprover",
-    model="gemini-flash-latest",
+    model=MODEL,
     description=(
         "HITL checkpoint before any production write. Shows the human exactly "
         "what will be written and where, then waits for their confirmation."
@@ -152,25 +263,39 @@ Your job:
 
 storer = Agent(
     name="DataStorer",
-    model="gemini-flash-latest",
+    model=MODEL,
     description="Writes the transformed data to the destination approved by the human.",
-    instruction="""
+    code_executor=UnsafeLocalCodeExecutor(),
+    instruction=f"""
 You are a data storage specialist. Read the WriteApprover's WRITE DECISION before
 writing anything.
+
+Check the "EXECUTION MODE" recorded by ExecutionModeChooser earlier in the conversation:
+- "EXECUTION MODE: execute"    → put your code in a single ```python fenced block.
+  It WILL run for real (only the first code block per turn executes). Read the
+  execution output before writing your final summary; report what actually
+  happened, not what you expect to happen.
+- "EXECUTION MODE: print_only" → put the exact same code in a ```text fenced
+  block instead (never ```python). This is deliberate — it prevents execution.
+  Say clearly that this is a preview only and nothing was written.
+
+Load input from `{STAGE_TRANSFORMED}` (do not rely on in-memory variables from
+the Transformer's turn — each pipeline step runs in its own isolated subprocess).
 
 If WRITE DECISION is 'production':
   - Write to the exact destination from the approved plan.
   - Write idempotently: temp path first, validate, then atomic rename/swap.
-  - For database targets: use bulk INSERT / COPY or upserts, not row-by-row inserts.
+  - For database targets (e.g. MongoDB via pymongo): use bulk inserts / upserts,
+    not row-by-row inserts.
   - Default format: Parquet (snappy). Use Delta / Iceberg for lakehouses.
-  - Log output path, file count, total bytes, and row count on success.
+  - print() output path/collection, row count, and bytes written on success.
 
 If WRITE DECISION is 'staging':
   - Write to ./staging/<destination_name> instead of the production path.
-  - Log clearly: "Written to staging at ./staging/<name> for human review."
+  - print() "Written to staging at ./staging/<name> for human review."
 
 If WRITE DECISION is 'abort':
-  - Do not write anything.
+  - Do not write or connect to anything.
   - Output: "Write aborted by human. No data was written."
 
 Always respect the approved plan's partitioning strategy.
@@ -185,7 +310,7 @@ pipeline = SequentialAgent(
 
 validator = Agent(
     name="DataQualityValidator",
-    model="gemini-flash-latest",
+    model=MODEL,
     description=(
         "Validates pipeline output against the plan's quality checks. "
         "Calls exit_loop when all checks pass; describes failures for the next iteration."
@@ -194,7 +319,12 @@ validator = Agent(
     instruction="""
 You are a data quality engineer. You run after every pipeline iteration.
 
-Steps:
+If "EXECUTION MODE: print_only" was recorded by ExecutionModeChooser: no code
+actually ran, so there is nothing to validate. Confirm the human only wanted a
+preview, summarise that the scripts were shown but not executed, and call
+exit_loop() — do not fail this iteration or ask the loop to retry.
+
+Otherwise (EXECUTION MODE: execute), steps:
 1. Re-read the quality checks from the approved plan.
 2. Check the Storer's output (path written, row count, any warnings).
    - If the Storer wrote to staging or aborted: fail this iteration and ask the
@@ -234,9 +364,9 @@ execution_loop = LoopAgent(
 root_agent = SequentialAgent(
     name="DataEngineeringOrchestrator",
     description=(
-        "Self-correcting data engineering pipeline with two human-in-the-loop "
-        "checkpoints: plan approval before execution, and write confirmation "
-        "before touching production data."
+        "Self-correcting data engineering pipeline with three human-in-the-loop "
+        "checkpoints: plan approval, execute-vs-print-only mode, and write "
+        "confirmation before touching production data."
     ),
-    sub_agents=[plan_approval_loop, execution_loop],
+    sub_agents=[plan_approval_loop, execution_mode_chooser, execution_loop],
 )
