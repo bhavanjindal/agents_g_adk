@@ -162,7 +162,7 @@ AGENT_MODEL_PROVIDER=anthropic ANTHROPIC_MODEL=claude-sonnet-5 \
   uv run adk run data_engineering_agent
 
 # One-off Ollama run — model MUST support tool calling, see the Ollama note below
-AGENT_MODEL_PROVIDER=ollama OLLAMA_MODEL=qwen2.5:14b \
+AGENT_MODEL_PROVIDER=ollama OLLAMA_MODEL=qwen3.6:latest \
   uv run adk run data_engineering_agent
 ```
 
@@ -260,7 +260,7 @@ ANTHROPIC_MODEL=claude-sonnet-5        # or claude-opus-4-8 (harder reasoning),
 
 # Local Ollama — no API key, no network egress; requires `ollama serve` running
 AGENT_MODEL_PROVIDER=ollama
-OLLAMA_MODEL=qwen2.5:14b               # must support TOOL CALLING — see note below
+OLLAMA_MODEL=qwen3.6:latest            # must support TOOL CALLING — see note below
 OLLAMA_API_BASE=http://localhost:11434 # optional, this is the default
 ```
 
@@ -302,6 +302,10 @@ Confirmed working: `qwen2.5:14b` (`ollama pull qwen2.5:14b`, ~9GB). If you want
 something smaller, `qwen2.5:3b` and `llama3.2:3b` are from tool-calling-capable
 model families, but verify with the command above after pulling — capability
 support isn't guaranteed to hold at every size within a family.
+
+`qwen3.6:latest` is the model currently configured in `.env` — verify it
+supports tool calling with the command above before relying on it (it hasn't
+been confirmed against this agent the way `qwen2.5:14b` has).
 
 Notes:
 - This repo pins `litellm<1.90`. Newer litellm releases ship an optional Rust
