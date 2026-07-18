@@ -23,7 +23,8 @@
       "Bash(AGENT_MODEL_PROVIDER=anthropic ANTHROPIC_MODEL=claude-opus-4-8 uv run python -c ' *)",
       "Bash(AGENT_MODEL_PROVIDER=ollama uv run python -c ' *)",
       "Bash(cd *)",
-      "Bash(kill 71106 71101 71099)"
+      "Bash(kill 71106 71101 71099)",
+      "Bash(awk '/^[a-z_]+ = Agent\\\\\\(/,/^\\\\\\)/' data_engineering_agent/agent.py)"
     ]
   }
 }

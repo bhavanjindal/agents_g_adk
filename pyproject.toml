@@ -6,7 +6,9 @@ dependencies = [
     "anthropic>=0.116.0",
     "google-adk",
     "litellm<1.90",
+    "mcp>=1.28.1",
     "polars>=1.42.1",
     "pymongo>=4.17.0",
     "python-dotenv",
+    "requests>=2.34.2",
 ]

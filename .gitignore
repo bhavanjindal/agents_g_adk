@@ -26,6 +26,9 @@ build/
 .adk/
 *.db
 
+# trade_agent dry-run audit log (local only, never committed)
+trade_agent/ledger/
+
 # IDE
 .idea/
 .vscode/

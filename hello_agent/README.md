@@ -17,10 +17,18 @@ Agent  (SuperHuman)
 
 ## How to run
 
+Requires a local Ollama server (`ollama serve`) with the model pulled — this
+agent always routes through Ollama, unlike `data_engineering_agent` which can
+switch providers via `AGENT_MODEL_PROVIDER`.
+
 ```bash
+ollama pull qwen3.6:latest   # one-time, ~23GB; override via OLLAMA_MODEL
 uv run adk run hello_agent
 uv run adk web hello_agent
 ```
+
+Set `OLLAMA_MODEL` / `OLLAMA_API_BASE` in `.env` (see `.env.example` at the
+repo root) to point at a different local model or host.
 
 ---
 
